@@ -9,6 +9,7 @@ Copy binary to /opt/logwatcher/logwatcher
 
 ### Flags
 ```go
+ignoreIPRanges = flag.String("ignoreIPs", "192.168.1,192.168.0,172.17.", "Cache JSON File Location for IP DATA")
 apiPort   = flag.String("apiPort", "2113", "Port for API Server")
 cacheFile = flag.String("cache", "./database/cache.json", "Cache JSON File Location for IP DATA")
 apiOnly   = flag.Bool("apiOnly", false, "Do not attempt to open a log file, just listen to api")
