@@ -48,7 +48,12 @@ kong_client_lastseen{geohash="ucftpvqu5527",place="RU/Moscow (109.248.6.17)",rou
 
 
 ## Grafana Dashboard
-Theres a dashboard output located [here](grafana)
+Theres a dashboard output located [here](grafana).
+
+You'll need to change `job` to match your prometheus job on `line 453`
+```json
+        "definition": "kong_client{job=\"nas\"}",
+```
 ### Example World Map
 ![Alt text](./img/example1.png)
 
