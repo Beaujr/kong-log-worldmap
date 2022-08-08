@@ -12,9 +12,15 @@ builds:
     dir: .
     main: main.go
     goos:
-      - linux
-      - windows
       - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - 6
+
 archives:
   - replacements:
       darwin: Darwin

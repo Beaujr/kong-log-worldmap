@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var ignoreIPRanges = flag.String("ignoreIPs", "192.168.1,192.168.0,172.17.", "Cache JSON File Location for IP DATA")
+var ignoreIPRanges = flag.String("ignoreIPs", "192.168.1,192.168.0,172.17.", "substring of IPs to ignore")
 
 type KongLogItem struct {
 	Latencies struct {
