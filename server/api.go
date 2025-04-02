@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,11 +23,21 @@ var (
 	apiPort   = flag.String("apiPort", "2113", "Port for API Server")
 	cacheFile = flag.String("cache", "./database/cache.json", "Cache JSON File Location for IP DATA")
 	apiOnly   = flag.Bool("apiOnly", false, "Do not attempt to open a log file, just listen to api")
-	logFile   = flag.String("log", "./log/all.log", "Log File Path")
+	logFile   = flag.String("log", "", "Log File Path")
 	database  = flag.String("db", "", "DB File Path")
+	loki      = flag.String("loki", "https://loki.whickerx.info", "loki url https://loki.whickerx.info")
+	lokiOrg   = flag.String("lokiOrg", "wst", "X-Scope-OrgID header value")
 )
 
-var metrics map[string]prometheus.Gauge
+type metrics struct {
+	metrics map[string]prometheus.Gauge
+	mu      sync.Mutex
+}
+
+type clients struct {
+	clients map[string]*KongClients
+	mu      sync.Mutex
+}
 
 type GrafanaQuery struct {
 	PanelID int `json:"panelId"`
@@ -60,11 +72,12 @@ type GrafanaQuery struct {
 
 type LogApiServer struct {
 	ts             []*TimeSeries
-	clients        map[string]*KongClients
+	clients        clients
 	ignoreIpRanges map[string]bool
 	logFile        *string
 	rateLimited    bool
 	database       *string
+	metrics        metrics
 }
 
 type TimeSeries struct {
@@ -84,12 +97,11 @@ func NewLogApiServer() *LogApiServer {
 	log.Printf("Database Flag: %s", *database)
 	log.Printf("Log Flag: %s", *logFile)
 	ts := make([]*TimeSeries, 0)
-	clients := make(map[string]*KongClients, 0)
-	cacheClients, err := readIPInfoCache(*cacheFile)
+
+	clients, err := readIPInfoCache(*cacheFile)
 	if err != nil {
 		log.Panic(err)
 	}
-	clients = cacheClients
 
 	localIPRanges := make(map[string]bool, 0)
 	idx := 0
@@ -97,39 +109,41 @@ func NewLogApiServer() *LogApiServer {
 		localIPRanges[strings.Split(*ignoreIPRanges, ",")[idx]] = true
 		idx++
 	}
-
 	return &LogApiServer{
 		ts:             ts,
-		clients:        clients,
+		clients:        *clients,
 		logFile:        logFile,
 		ignoreIpRanges: localIPRanges,
 		rateLimited:    false,
 		database:       database,
+		metrics:        metrics{metrics: map[string]prometheus.Gauge{}, mu: sync.Mutex{}},
 	}
 }
 
 func (l *LogApiServer) StartServer() {
-	metricsInit := make(map[string]prometheus.Gauge)
-	metrics = metricsInit
 	http.HandleFunc("/query", l.timeseriesHandler)
 	http.HandleFunc("/search", l.searchDemoHandler)
 	http.HandleFunc("/countries", l.clientHandler)
 	http.HandleFunc("/log", l.log)
 	http.Handle("/metrics", promhttp.Handler())
-	err := l.initDatabase()
-	if err != nil {
-		log.Println(err)
-	}
-	if !*apiOnly {
-		go http.ListenAndServe(fmt.Sprintf(":%s", *apiPort), nil)
-		err = l.readLog(*l.logFile)
+	go func() {
+		err := l.initDatabase()
 		if err != nil {
 			log.Println(err)
 		}
-	} else {
-		http.ListenAndServe(fmt.Sprintf(":%s", *apiPort), nil)
-	}
+	}()
 
+	if !*apiOnly {
+		if *logFile != "" {
+			go func() {
+				err := l.readLog(*l.logFile)
+				if err != nil {
+					log.Println(err)
+				}
+			}()
+		}
+	}
+	http.ListenAndServe(fmt.Sprintf(":%s", *apiPort), nil)
 }
 func (l *LogApiServer) initDatabase() error {
 	if *l.database == "" {
@@ -141,23 +155,56 @@ func (l *LogApiServer) initDatabase() error {
 	}
 	fileScanner := bufio.NewScanner(data)
 	fileScanner.Split(bufio.ScanLines)
-
-	for fileScanner.Scan() {
-		var logLine KongLogItem
-		err = json.Unmarshal([]byte(fileScanner.Text()), &logLine)
-		if err != nil {
-			return err
-		}
-		err = l.processLogLine(logLine)
-		if err != nil {
-			return err
-		}
+	var wg sync.WaitGroup
+	ch := make(chan []byte)
+	// start the workers
+	for t := 0; t < 40; t++ {
+		wg.Add(1)
+		go l.saveToDB(ch, &wg)
 	}
+	for fileScanner.Scan() {
+		//log.Printf("reading line: %d\n", line)
+		text := fileScanner.Text()
+		if len(text) == 0 {
+			continue
+		}
+
+		ch <- []byte(text)
+	}
+	close(ch)
+	wg.Wait()
 	return data.Close()
 }
 
+func (l *LogApiServer) saveToDB(ch chan []byte, waitgroup *sync.WaitGroup) {
+	// cnosume a line
+	for text := range ch {
+		// do work
+		var logLine KongLogItem
+		err := json.Unmarshal(text, &logLine)
+		if err != nil {
+			log.Printf("error: %s on log line:%s\n", err.Error(), text)
+		}
+		secondsSince := int64(time.Now().Unix()) - logLine.StartedAt/1000
+		if secondsSince > 604800 {
+			log.Printf("skippimg %s hit us %s ago\n", logLine.ClientIP, secondsToHuman(int(secondsSince)))
+			if logLine.Request.Headers["host"] != nil && strings.Contains(logLine.Request.Headers["host"].(string), "jf.beau.cf") {
+				logLine.StartedAt = time.Now().UnixMilli()
+			} else {
+				continue
+			}
+
+		}
+		err = l.processLogLine(logLine)
+		if err != nil {
+			log.Printf("error: %s on log line:%s\n", err.Error(), string(text))
+		}
+	}
+	waitgroup.Done()
+}
+
 func (l *LogApiServer) log(w http.ResponseWriter, req *http.Request) {
-	var kongLogLine KongLogItem
+	var kongLogLine []KongLogItem
 	buf, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		log.Println("error decrypting query")
@@ -177,18 +224,23 @@ func (l *LogApiServer) log(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	err = l.processLogLine(kongLogLine)
-	if err != nil {
-		log.Println(fmt.Sprintf("Payload form Error: %s", err))
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+	for _, item := range kongLogLine {
+		err = l.processLogLine(item)
+		if err != nil {
+			log.Println(fmt.Sprintf("Payload form Error: %s", err))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	}
+	w.WriteHeader(200)
+	return
+
 }
 
 func (l *LogApiServer) clientHandler(w http.ResponseWriter, req *http.Request) {
 	log.Println(req.URL)
 	clientArray := make([]*KongClients, 0)
-	for _, v := range l.clients {
+	for _, v := range l.clients.clients {
 		clientArray = append(clientArray, v)
 	}
 	js, err := json.Marshal(clientArray)
@@ -203,7 +255,14 @@ func (l *LogApiServer) clientHandler(w http.ResponseWriter, req *http.Request) {
 	w.Write(js)
 	return
 }
+func postLog(body []byte) {
+	url := "http://192.168.1.232:80/logs"
 
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req.Header.Add("Host", "ipresolver")
+	http.DefaultClient.Do(req)
+	return
+}
 func (l *LogApiServer) timeseriesHandler(w http.ResponseWriter, req *http.Request) {
 	log.Println(req.URL)
 	var query GrafanaQuery
@@ -320,15 +379,15 @@ func (l *LogApiServer) searchDemoHandler(w http.ResponseWriter, req *http.Reques
 	return
 }
 
-func (L *LogApiServer) registerMetric(key string, lat float64, lng float64, name string, route string, service string, seenAt float64) {
+func (L *LogApiServer) registerMetric(key string, lat float64, lng float64, name, route, service, host string, seenAt float64) {
 	if len(route) == 0 {
 		route = "Unknown"
 	}
 	if len(service) == 0 {
 		service = "Unknown"
 	}
-	if metrics[key] == nil {
-		metrics[key] = promauto.NewGauge(prometheus.GaugeOpts{
+	if L.metrics.metrics[key] == nil {
+		L.metrics.metrics[key] = promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "kong_client",
 			Help: "Client hitting kong server",
 			ConstLabels: prometheus.Labels{
@@ -337,13 +396,14 @@ func (L *LogApiServer) registerMetric(key string, lat float64, lng float64, name
 				"place":   name,
 				"route":   route,
 				"service": service,
+				"host":    host,
 			},
 		})
-		metrics[key].Set(0)
+		L.metrics.metrics[key].Set(0)
 	}
 	metricLastSeenKey := fmt.Sprintf("%s_lastseen", key)
-	if metrics[metricLastSeenKey] == nil {
-		metrics[metricLastSeenKey] = promauto.NewGauge(prometheus.GaugeOpts{
+	if L.metrics.metrics[metricLastSeenKey] == nil {
+		L.metrics.metrics[metricLastSeenKey] = promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "kong_client_lastseen",
 			Help: "Client last hit the kong server",
 			ConstLabels: prometheus.Labels{
@@ -352,9 +412,10 @@ func (L *LogApiServer) registerMetric(key string, lat float64, lng float64, name
 				"place":   name,
 				"route":   route,
 				"service": service,
+				"host":    host,
 			},
 		})
 	}
-	metrics[key].Add(1)
-	metrics[metricLastSeenKey].Set(seenAt)
+	L.metrics.metrics[key].Add(1)
+	L.metrics.metrics[metricLastSeenKey].Set(seenAt)
 }

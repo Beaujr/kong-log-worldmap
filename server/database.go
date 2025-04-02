@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"sync"
 )
 
 func writeKongClients(data map[string]*KongClients) error {
@@ -40,25 +42,30 @@ func writeKongHits(data string) error {
 	return nil
 }
 
-func readIPInfoCache(filename string) (map[string]*KongClients, error) {
+func readIPInfoCache(filename string) (*clients, error) {
+	var result map[string]*KongClients
 	// Open our yamlFile
 	jsonFile, err := os.Open(filename)
 	// if we os.Open returns an error then handle it
 	if err != nil {
-		fmt.Println(err)
+		if os.IsNotExist(err) {
+			return &clients{clients: map[string]*KongClients{}, mu: sync.Mutex{}}, nil
+		} else {
+			return nil, err
+		}
+
 	}
 	log.Println(fmt.Sprintf("Successfully Opened: %s", filename))
 	defer jsonFile.Close()
 
-	byteValue, err := ioutil.ReadAll(jsonFile)
+	byteValue, err := io.ReadAll(jsonFile)
 	if err != nil {
 		return nil, err
 	}
 
-	var result map[string]*KongClients
 	err = json.Unmarshal(byteValue, &result)
 	if err != nil {
 		return nil, err
 	}
-	return result, nil
+	return &clients{clients: result, mu: sync.Mutex{}}, nil
 }

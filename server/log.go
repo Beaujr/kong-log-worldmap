@@ -1,20 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/hpcloud/tail"
 	"log"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-var ignoreIPRanges = flag.String("ignoreIPs", "192.168.1,192.168.0,172.17.", "substring of IPs to ignore")
+var ignoreIPRanges = flag.String("ignoreIPs", "192.168.1,192.168.0,172.17.,10.42.", "substring of IPs to ignore")
 
-type KongLogItem struct {
+type X struct {
 	Latencies struct {
 		Request int     `json:"request"`
 		Proxy   float64 `json:"proxy"`
@@ -56,40 +58,17 @@ type KongLogItem struct {
 		Name           string `json:"name"`
 		Retries        int    `json:"retries"`
 	} `json:"service"`
+	CountryCode string `json:"countryCode,omitempty"`
 	//Tries []struct {
 	//	BalancerLatency int    `json:"balancer_latency"`
 	//	Port            int    `json:"port"`
 	//	BalancerStart   int64  `json:"balancer_start"`
 	//	IP              string `json:"ip"`
 	//} `json:"tries"`
-	//Request struct {
-	//Headers struct {
-	//	SecWebsocketVersion    string `json:"sec-websocket-version"`
-	//	SecWebsocketKey        string `json:"sec-websocket-key"`
-	//	UserAgent              string `json:"user-agent"`
-	//	SecWebsocketExtensions string `json:"sec-websocket-extensions"`
-	//	//Host                   string `json:"host"`
-	//	Cookie                 string `json:"cookie"`
-	//	Origin                 string `json:"origin"`
-	//	AcceptLanguage         string `json:"accept-language"`
-	//	AcceptEncoding         string `json:"accept-encoding"`
-	//	Upgrade                string `json:"upgrade"`
-	//	Connection             string `json:"connection"`
-	//	CacheControl           string `json:"cache-control"`
-	//	Pragma                 string `json:"pragma"`
-	//} `json:"headers"`
-	//	TLS struct {
-	//		ClientVerify string `json:"client_verify"`
-	//		Version      string `json:"version"`
-	//		Cipher       string `json:"cipher"`
-	//	} `json:"tls"`
-	//	URI         string `json:"uri"`
-	//	Size        int    `json:"size"`
-	//	Method      string `json:"method"`
-	//	URL         string `json:"url"`
-	//	Querystring struct {
-	//	} `json:"querystring"`
-	//} `json:"request"`
+	Request struct {
+		Headers map[string]interface {
+		} `json:"headers,omitempty"`
+	} `json:"request,omitempty"`
 	Response struct {
 		//Headers struct {
 		//	Vary                    string `json:"vary"`
@@ -104,8 +83,68 @@ type KongLogItem struct {
 		//	SecWebsocketAccept      string `json:"sec-websocket-accept"`
 		//} `json:"headers"`
 		Status int `json:"status"`
-		//Size   int `json:"size"`
+		Size   int `json:"size"`
 	} `json:"response"`
+}
+type KongLogItem struct {
+	UpstreamStatus string `json:"upstream_status,omitempty"`
+	UpstreamUri    string `json:"upstream_uri,omitempty"`
+	CountryCode    string `json:"countryCode,omitempty"`
+	Response       struct {
+		Headers map[string]interface{} `json:"headers,omitempty"`
+		Status  int                    `json:"status,omitempty"`
+		Size    int                    `json:"size,omitempty"`
+	} `json:"response,omitempty"`
+	ClientIP string `json:"client_ip,omitempty"`
+	Route    struct {
+		RequestBuffering        bool     `json:"request_buffering,omitempty"`
+		ResponseBuffering       bool     `json:"response_buffering,omitempty"`
+		CreatedAt               int      `json:"created_at,omitempty"`
+		UpdatedAt               int      `json:"updated_at,omitempty"`
+		HttpsRedirectStatusCode int      `json:"https_redirect_status_code,omitempty"`
+		Protocols               []string `json:"protocols,omitempty"`
+		Name                    string   `json:"name,omitempty"`
+		Service                 struct {
+			Id string `json:"id,omitempty"`
+		} `json:"service,omitempty"`
+		StripPath     bool     `json:"strip_path,omitempty"`
+		Id            string   `json:"id,omitempty"`
+		PathHandling  string   `json:"path_handling,omitempty"`
+		RegexPriority int      `json:"regex_priority,omitempty"`
+		Hosts         []string `json:"hosts,omitempty"`
+		PreserveHost  bool     `json:"preserve_host,omitempty"`
+	} `json:"route,omitempty"`
+	Service struct {
+		ReadTimeout  int    `json:"read_timeout,omitempty"`
+		CreatedAt    int    `json:"created_at,omitempty"`
+		UpdatedAt    int    `json:"updated_at,omitempty"`
+		Host         string `json:"host,omitempty"`
+		Enabled      bool   `json:"enabled,omitempty"`
+		Protocol     string `json:"protocol,omitempty"`
+		WriteTimeout int    `json:"write_timeout,omitempty"`
+		Name         string `json:"name,omitempty"`
+		Port         int    `json:"port,omitempty"`
+		//Tags           []interface{} `json:"tags,omitempty"`
+		Id             string `json:"id,omitempty"`
+		WsId           string `json:"ws_id,omitempty"`
+		Retries        int    `json:"retries,omitempty"`
+		ConnectTimeout int    `json:"connect_timeout,omitempty"`
+	} `json:"service,omitempty"`
+	StartedAt int64 `json:"started_at,omitempty"`
+	Request   struct {
+		Tls struct {
+			Cipher       string `json:"cipher,omitempty"`
+			Version      string `json:"version,omitempty"`
+			ClientVerify string `json:"client_verify,omitempty"`
+		} `json:"tls,omitempty"`
+		Size        int                    `json:"size,omitempty"`
+		Headers     map[string]interface{} `json:"headers,omitempty"`
+		Querystring struct {
+		} `json:"querystring,omitempty"`
+		Uri    string `json:"uri,omitempty"`
+		Url    string `json:"url,omitempty"`
+		Method string `json:"method,omitempty"`
+	} `json:"request,omitempty"`
 }
 
 type IPInfo struct {
@@ -144,55 +183,82 @@ func (l *LogApiServer) readLog(logLocation string) error {
 	return nil
 }
 func (l *LogApiServer) processLogLine(jsonLogLine KongLogItem) error {
+	host := "unknown"
+	if header, ok := jsonLogLine.Request.Headers["host"]; ok {
+		host = header.(string)
+	}
+	line, err := json.Marshal(jsonLogLine)
+	if err != nil {
+		return err
+	}
 	secondsSince := int64(time.Now().Unix()) - jsonLogLine.StartedAt/1000
 	clientIp := jsonLogLine.ClientIP
-	if !l.ignoreIP(clientIp) {
-		log.Printf("%s hit us %s ago", clientIp, secondsToHuman(int(secondsSince)))
-		if l.clients[jsonLogLine.ClientIP] == nil || (l.clients[jsonLogLine.ClientIP] != nil && strings.Index(l.clients[jsonLogLine.ClientIP].Name, "/") == 0) {
-			log.Printf("IP not found in cache: %s", clientIp)
-			location :=
-				[]string{""}
-			ipdata := IPInfo{}
-			if !l.rateLimited {
-				ipdata = l.getIPINFO(clientIp)
-				location = strings.Split(ipdata.Loc, ",")
-			}
-
-			if len(location) != 2 {
-				log.Printf("Couldnt find ipinfo.io data for %s", clientIp)
-				log.Println("IPINFO response probably rate limited")
-				l.rateLimited = true
-				l.clients[clientIp] = &KongClients{
-					Key:       clientIp,
-					Latitude:  0.0,
-					Longitude: 0.0,
-					Name:      fmt.Sprintf("%s/%s (%s)", "Unknown", "Unknown", clientIp),
-				}
-			} else {
-				lat, _ := strconv.ParseFloat(location[0], 64)
-				lng, _ := strconv.ParseFloat(location[1], 64)
-				l.clients[clientIp] = &KongClients{
-					Key:       clientIp,
-					Latitude:  lat,
-					Longitude: lng,
-					Name:      fmt.Sprintf("%s/%s (%s)", ipdata.Country, ipdata.City, clientIp),
-				}
-				err := writeKongClients(l.clients)
-				if err != nil {
-					log.Panic(err)
-				}
-			}
-		}
-		if l.clients[clientIp] != nil {
-			l.registerMetric(clientIp, l.clients[clientIp].Latitude, l.clients[clientIp].Longitude, l.clients[clientIp].Name, jsonLogLine.Route.Name, jsonLogLine.Service.Name, float64(jsonLogLine.StartedAt/1000))
-		}
-		l.ts = append(l.ts, &TimeSeries{
-			Target: clientIp,
-			Datapoints: [][]float64{
-				{1, float64(jsonLogLine.StartedAt / 1000)},
-			},
-		})
+	if l.ignoreIP(clientIp) {
+		//go pushLineToLoki(jsonLogLine.StartedAt, string(line), map[string]interface{}{"label": "kong", "host": host})
+		return nil
 	}
+	log.Printf("{\"ip\":\"%s\", \"msg\":\"hit us %s ago\"}", clientIp, secondsToHuman(int(secondsSince)))
+	if client, ok := l.clients.clients[jsonLogLine.ClientIP]; ok {
+		cc := strings.Split(client.Name, "/")
+		if len(cc) > 0 {
+			jsonLogLine.CountryCode = cc[0]
+		}
+	}
+
+	if l.clients.clients[jsonLogLine.ClientIP] == nil || (l.clients.clients[jsonLogLine.ClientIP] != nil && strings.Index(l.clients.clients[jsonLogLine.ClientIP].Name, "/") == 0) {
+		l.clients.mu.Lock()
+		log.Printf("IP not found in cache: %s", clientIp)
+		location :=
+			[]string{""}
+		ipdata := IPInfo{}
+		if !l.rateLimited {
+			ipdata = l.getIPINFO(clientIp)
+			location = strings.Split(ipdata.Loc, ",")
+		}
+
+		if len(location) != 2 {
+			log.Printf("Couldnt find ipinfo.io data for %s", clientIp)
+			log.Println("IPINFO response probably rate limited")
+			l.rateLimited = true
+			l.clients.clients[clientIp] = &KongClients{
+				Key:       clientIp,
+				Latitude:  0.0,
+				Longitude: 0.0,
+				Name:      fmt.Sprintf("%s/%s (%s)", "Unknown", "Unknown", clientIp),
+			}
+		} else {
+			lat, _ := strconv.ParseFloat(location[0], 64)
+			lng, _ := strconv.ParseFloat(location[1], 64)
+			l.clients.clients[clientIp] = &KongClients{
+				Key:       clientIp,
+				Latitude:  lat,
+				Longitude: lng,
+				Name:      fmt.Sprintf("%s/%s (%s)", ipdata.Country, ipdata.City, clientIp),
+			}
+			err := writeKongClients(l.clients.clients)
+			if err != nil {
+				log.Panic(err)
+			}
+		}
+		l.clients.mu.Unlock()
+	}
+	if l.clients.clients[clientIp] != nil {
+		host := "unknown"
+		if item, exist := jsonLogLine.Request.Headers["host"]; exist {
+			host = item.(string)
+		}
+		l.metrics.mu.Lock()
+		defer l.metrics.mu.Unlock()
+		l.registerMetric(clientIp, l.clients.clients[clientIp].Latitude, l.clients.clients[clientIp].Longitude, l.clients.clients[clientIp].Name, jsonLogLine.Route.Name, jsonLogLine.Service.Name, host, float64(jsonLogLine.StartedAt/1000))
+	}
+	l.ts = append(l.ts, &TimeSeries{
+		Target: clientIp,
+		Datapoints: [][]float64{
+			{1, float64(jsonLogLine.StartedAt / 1000)},
+		},
+	})
+	go pushExternalLineToloki(jsonLogLine.StartedAt, host, string(line), jsonLogLine.CountryCode)
+
 	return nil
 }
 func plural(count int, singular string) (result string) {
@@ -202,6 +268,60 @@ func plural(count int, singular string) (result string) {
 		result = strconv.Itoa(count) + " " + singular + "s "
 	}
 	return
+}
+
+func pushExternalLineToloki(timestamp int64, host, line, countryCode string) {
+	labels := map[string]interface{}{"label": "logwatcher", "host": host, "countryCode": countryCode}
+	pushLineToLoki(timestamp, line, labels)
+}
+func pushLineToLoki(timestamp int64, line string, labels map[string]interface{}) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("Error pushing to loki: %s\n", err)
+		}
+	}()
+	logtimestamp := timestamp * 1000000
+	weekAgo := time.Now().AddDate(0, 0, -7).UnixNano()
+	if logtimestamp < weekAgo {
+		return
+	}
+	//timestampStr := strconv.Itoa(logtimestamp)
+	type payloadBody struct {
+		Stream map[string]interface{} `json:"stream,omitempty"`
+		Values [][]string             `json:"values,omitempty"`
+	}
+
+	type AutoGenerated struct {
+		Streams []payloadBody `json:"streams,omitempty"`
+	}
+	pb := payloadBody{
+		Stream: labels,
+		Values: [][]string{{fmt.Sprintf("%d", logtimestamp), line}},
+	}
+	out, err := json.Marshal(AutoGenerated{Streams: []payloadBody{pb}})
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	payload := bytes.NewReader(out)
+	url := fmt.Sprintf("%s/loki/api/v1/push", *loki)
+	//log.Printf("pushing to %s", url)
+	req, err := http.NewRequest("POST", url, payload)
+	if err != nil {
+		panic(err)
+	}
+	req.Header.Add("X-Scope-OrgID", *lokiOrg)
+	req.Header.Add("content-type", "application/json")
+	req.Header.Add("cache-control", "no-cache")
+	//log.Println("do push")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	//log.Println("getting status code")
+	if res.StatusCode != http.StatusNoContent {
+		log.Printf("Log: %d weekAgo: %d\n", logtimestamp, weekAgo)
+	}
 }
 
 func secondsToHuman(input int) (result string) {
